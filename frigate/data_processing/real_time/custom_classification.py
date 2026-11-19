@@ -248,26 +248,74 @@ class ONNXClassifierBackend(ClassificationBackend):
         return _normalize_scores(res)
 
 
+class RKNNClassifierBackend(ClassificationBackend):
+    """Rockchip NPU backend using Frigate's RKNNModelRunner for .rknn models."""
+
+    backend_name = "RKNN"
+
+    def __init__(
+        self,
+        model_path: str,
+        width: int = CLASSIFICATION_INPUT_SIZE[0],
+        height: int = CLASSIFICATION_INPUT_SIZE[1],
+        input_tensor: InputTensorEnum = InputTensorEnum.nhwc,
+        input_pixel_format: PixelFormatEnum = PixelFormatEnum.rgb,
+        input_dtype: InputDTypeEnum = InputDTypeEnum.int,
+    ) -> None:
+        super().__init__(
+            width=width,
+            height=height,
+            input_tensor=input_tensor,
+            input_pixel_format=input_pixel_format,
+            input_dtype=input_dtype,
+        )
+        from frigate.detectors.detection_runners import RKNNModelRunner
+
+        self.runner = RKNNModelRunner(model_path=model_path)
+        self.input_name = self.runner.get_input_names()[0]
+
+    def predict(self, resized_rgb: np.ndarray) -> np.ndarray:
+        tensor_in = self._transform_input(resized_rgb)
+        outputs = self.runner.run({self.input_name: tensor_in})
+        return _normalize_scores(outputs[0][0])
+
+
 def load_classification_backend(
     model_dir: str,
     model_config: CustomClassificationConfig,
 ) -> tuple[ClassificationBackend | None, dict[int, str]]:
-    """Load the first available classification backend (.onnx, .tflite) and labelmap."""
+    """Load the first available classification backend (.rknn, .onnx, .tflite) and labelmap."""
     labelmap_path = os.path.join(model_dir, "labelmap.txt")
     if not os.path.exists(labelmap_path):
         return None, {}
 
-    common_kwargs: dict[str, Any] = {
-        "device": model_config.device,
+    shape_kwargs: dict[str, Any] = {
         "width": model_config.width,
         "height": model_config.height,
         "input_tensor": model_config.input_tensor,
         "input_pixel_format": model_config.input_pixel_format,
         "input_dtype": model_config.input_dtype,
     }
+    common_kwargs: dict[str, Any] = {"device": model_config.device, **shape_kwargs}
+
+    rknn_path = os.path.join(model_dir, "model.rknn")
+    if os.path.exists(rknn_path):
+        return (
+            RKNNClassifierBackend(rknn_path, **shape_kwargs),
+            load_labels(labelmap_path, prefill=0, indexed=False),
+        )
 
     onnx_path = os.path.join(model_dir, "model.onnx")
     if os.path.exists(onnx_path):
+        if (model_config.device or "").upper() == "RKNN":
+            from frigate.util.rknn_converter import auto_convert_model
+
+            converted = auto_convert_model(onnx_path)
+            if converted:
+                return (
+                    RKNNClassifierBackend(converted, **shape_kwargs),
+                    load_labels(labelmap_path, prefill=0, indexed=False),
+                )
         return (
             ONNXClassifierBackend(onnx_path, **common_kwargs),
             load_labels(labelmap_path, prefill=0, indexed=False),
