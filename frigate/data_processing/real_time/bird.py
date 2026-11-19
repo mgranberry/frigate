@@ -121,8 +121,8 @@ class BirdRealTimeProcessor(RealTimeProcessorApi):
             obj_data["box"][3],
             int(
                 max(
-                    obj_data["box"][1] - obj_data["box"][0],
-                    obj_data["box"][3] - obj_data["box"][2],
+                    obj_data["box"][2] - obj_data["box"][0],
+                    obj_data["box"][3] - obj_data["box"][1],
                 )
                 * 1.1
             ),
