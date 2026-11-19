@@ -281,8 +281,17 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
             logger.warning("Failed to resize image for state classification")
             return
 
-        # Copy for training image saves on worker thread
-        crop_bgr = cv2.cvtColor(cropped_frame, cv2.COLOR_RGB2BGR)
+        save_attempts = (
+            self.model_config.save_attempts
+            if self.model_config.save_attempts is not None
+            else 100
+        )
+        # Skip BGR conversion unless training attempts will be saved.
+        crop_bgr = (
+            cv2.cvtColor(cropped_frame, cv2.COLOR_RGB2BGR)
+            if save_attempts > 0
+            else None
+        )
 
         self._enqueue_task(("classify", camera, now, resized_frame, crop_bgr))
 
@@ -309,15 +318,16 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
                     if self.model_config.save_attempts is not None
                     else 100
                 )
-                write_classification_attempt(
-                    self.train_dir,
-                    crop_bgr,
-                    "none-none",
-                    timestamp,
-                    "unknown",
-                    0.0,
-                    max_files=save_attempts,
-                )
+                if save_attempts > 0 and crop_bgr is not None:
+                    write_classification_attempt(
+                        self.train_dir,
+                        crop_bgr,
+                        "none-none",
+                        timestamp,
+                        "unknown",
+                        0.0,
+                        max_files=save_attempts,
+                    )
             return
 
         if not self.tensor_input_details or not self.tensor_output_details:
@@ -345,15 +355,16 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
                 if self.model_config.save_attempts is not None
                 else 100
             )
-            write_classification_attempt(
-                self.train_dir,
-                crop_bgr,
-                "none-none",
-                timestamp,
-                detected_state,
-                score,
-                max_files=save_attempts,
-            )
+            if save_attempts > 0 and crop_bgr is not None:
+                write_classification_attempt(
+                    self.train_dir,
+                    crop_bgr,
+                    "none-none",
+                    timestamp,
+                    detected_state,
+                    score,
+                    max_files=save_attempts,
+                )
 
         if score < self.model_config.threshold:
             logger.debug(
@@ -589,8 +600,13 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             logger.warning("Failed to resize image for object classification")
             return
 
-        # Copy crop for training images (will be used on worker thread)
-        crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+        save_attempts = (
+            self.model_config.save_attempts
+            if self.model_config.save_attempts is not None
+            else 200
+        )
+        # Skip BGR conversion unless training attempts will be saved.
+        crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR) if save_attempts > 0 else None
 
         self._enqueue_task(
             ("classify", object_id, obj_data["camera"], now, resized_crop, crop_bgr)
@@ -622,15 +638,16 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
                 if self.model_config.save_attempts is not None
                 else 200
             )
-            write_classification_attempt(
-                self.train_dir,
-                crop_bgr,
-                object_id,
-                timestamp,
-                "unknown",
-                0.0,
-                max_files=save_attempts,
-            )
+            if save_attempts > 0 and crop_bgr is not None:
+                write_classification_attempt(
+                    self.train_dir,
+                    crop_bgr,
+                    object_id,
+                    timestamp,
+                    "unknown",
+                    0.0,
+                    max_files=save_attempts,
+                )
 
             # Still track history even when model doesn't exist to respect MAX_OBJECT_CLASSIFICATIONS
             # Add an entry with "unknown" label so the history limit is enforced
@@ -662,15 +679,16 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             if self.model_config.save_attempts is not None
             else 200
         )
-        write_classification_attempt(
-            self.train_dir,
-            crop_bgr,
-            object_id,
-            timestamp,
-            self.labelmap[best_id],
-            score,
-            max_files=save_attempts,
-        )
+        if save_attempts > 0 and crop_bgr is not None:
+            write_classification_attempt(
+                self.train_dir,
+                crop_bgr,
+                object_id,
+                timestamp,
+                self.labelmap[best_id],
+                score,
+                max_files=save_attempts,
+            )
 
         if score < self.model_config.threshold:
             logger.debug(
@@ -743,6 +761,9 @@ def write_classification_attempt(
     score: float,
     max_files: int = 100,
 ) -> None:
+    if max_files <= 0:
+        return
+
     if "-" in label:
         label = label.replace("-", "_")
 
