@@ -18,6 +18,7 @@ from frigate.util.image import calculate_region
 
 from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
+from .custom_classification import yuv_crop_to_rgb
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -129,11 +130,7 @@ class BirdRealTimeProcessor(RealTimeProcessorApi):
             1.0,
         )
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
-        input = rgb[
-            y:y2,
-            x:x2,
-        ]
+        input = yuv_crop_to_rgb(frame, x, y, x2, y2)
 
         if input.shape != (224, 224):
             try:

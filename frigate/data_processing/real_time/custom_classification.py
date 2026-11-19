@@ -35,6 +35,64 @@ logger = logging.getLogger(__name__)
 MAX_OBJECT_CLASSIFICATIONS = 16
 
 
+def yuv_crop_to_rgb(yuv: np.ndarray, x: int, y: int, x2: int, y2: int) -> np.ndarray:
+    """Convert only the clamped even-aligned YUV420 I420 sub-region to RGB and pad edges."""
+    if x2 <= x or y2 <= y:
+        return np.zeros((max(1, y2 - y), max(1, x2 - x), 3), dtype=np.uint8)
+
+    img_h = yuv.shape[0] * 2 // 3
+    img_w = yuv.shape[1]
+    cx1 = max(0, x & ~1)
+    cy1 = max(0, y & ~1)
+    cx2 = min(img_w, (x2 + 1) & ~1)
+    cy2 = min(img_h, (y2 + 1) & ~1)
+    cw, ch = cx2 - cx1, cy2 - cy1
+    if cw <= 0 or ch <= 0:
+        return np.zeros((max(1, y2 - y), max(1, x2 - x), 3), dtype=np.uint8)
+
+    sx1, sy1 = max(0, x) - cx1, max(0, y) - cy1
+    sx2, sy2 = min(img_w, x2) - cx1, min(img_h, y2) - cy1
+    if sx2 <= sx1 or sy2 <= sy1:
+        return np.zeros((max(1, y2 - y), max(1, x2 - x), 3), dtype=np.uint8)
+
+    u_off = img_h
+    v_off = img_h + img_h // 4
+    uv_x1, uv_x2 = cx1 // 2, cx2 // 2
+    uv_y1, uv_y2 = cy1 // 2, cy2 // 2
+    uv_w, uv_h = uv_x2 - uv_x1, uv_y2 - uv_y1
+
+    y_plane = yuv[cy1:cy2, cx1:cx2]
+    u_full = yuv[u_off:v_off, :].reshape(img_h // 2, img_w // 2)
+    v_full = yuv[v_off:, :].reshape(img_h // 2, img_w // 2)
+    u_plane = u_full[uv_y1:uv_y2, uv_x1:uv_x2]
+    v_plane = v_full[uv_y1:uv_y2, uv_x1:uv_x2]
+
+    sub_i420 = np.empty((ch * 3 // 2, cw), dtype=np.uint8)
+    sub_i420[:ch, :] = y_plane
+    uv_size = uv_h * uv_w
+    flat_uv = sub_i420[ch:, :].ravel()
+    flat_uv[:uv_size] = u_plane.ravel()
+    flat_uv[uv_size : 2 * uv_size] = v_plane.ravel()
+    sub_rgb = cv2.cvtColor(sub_i420, cv2.COLOR_YUV2RGB_I420)
+
+    crop = sub_rgb[sy1:sy2, sx1:sx2]
+    pad_top = max(0, -y)
+    pad_left = max(0, -x)
+    pad_bottom = max(0, y2 - img_h)
+    pad_right = max(0, x2 - img_w)
+    if pad_top or pad_bottom or pad_left or pad_right:
+        crop = cv2.copyMakeBorder(
+            crop,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+    return crop
+
+
 class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
     def __init__(
         self,
@@ -252,8 +310,8 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
         if not should_run:
             return
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
-        height, width = rgb.shape[:2]
+        height = frame.shape[0] * 2 // 3
+        width = frame.shape[1]
 
         # Convert normalized crop coordinates to pixel values
         x1 = int(camera_config.crop[0] * width)
@@ -273,7 +331,7 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
             )
             return
 
-        cropped_frame = rgb[y1:y2, x1:x2]
+        cropped_frame = yuv_crop_to_rgb(frame, x1, y1, x2, y2)
 
         try:
             resized_frame = resize_classification_image(cropped_frame)
@@ -580,8 +638,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             1.0,
         )
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
-        crop = rgb[y:y2, x:x2]
+        crop = yuv_crop_to_rgb(frame, x, y, x2, y2)
 
         try:
             resized_crop = resize_classification_image(crop)
