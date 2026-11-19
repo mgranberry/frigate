@@ -567,8 +567,9 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             return
 
         now = datetime.datetime.now().timestamp()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
         x, y, x2, y2 = calculate_region(
-            frame.shape,
+            rgb.shape,
             obj_data["box"][0],
             obj_data["box"][1],
             obj_data["box"][2],
@@ -579,8 +580,6 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             ),
             1.0,
         )
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
         crop = rgb[y:y2, x:x2]
 
         try:
