@@ -1,6 +1,13 @@
 from enum import Enum
+from typing import Literal
 
 from pydantic import ConfigDict, Field, field_validator
+
+from frigate.detectors.detector_config import (
+    InputDTypeEnum,
+    InputTensorEnum,
+    PixelFormatEnum,
+)
 
 from .base import FrigateBaseModel
 
@@ -155,6 +162,17 @@ class CustomClassificationObjectConfig(FrigateBaseModel):
         title="Classification type",
         description="Classification type applied: 'sub_label' (adds sub_label) or other supported types.",
     )
+    crop_strategy: Literal["square", "tight", "letterbox"] = Field(
+        default="square",
+        title="Crop strategy",
+        description="How to crop detected objects before resizing: 'square' (expand short edge to square), 'tight' (direct bbox warp), or 'letterbox' (aspect-preserving pad).",
+    )
+    crop_scale: float = Field(
+        default=1.0,
+        title="Crop scale",
+        description="Multiplier applied to the bounding box dimensions before cropping.",
+        ge=1.0,
+    )
 
 
 class CustomClassificationConfig(FrigateBaseModel):
@@ -178,6 +196,36 @@ class CustomClassificationConfig(FrigateBaseModel):
         title="Save attempts",
         description="How many classification attempts to save for recent classifications UI.",
         ge=0,
+    )
+    device: str | None = Field(
+        default="AUTO",
+        title="Device Type",
+        description="Device for classification inference (e.g. 'AUTO', 'CPU', 'Tensorrt', 'edgetpu', 'usb', 'pci', '0').",
+    )
+    width: int = Field(
+        default=224,
+        title="Classification model input width",
+        description="Width of the model input tensor in pixels.",
+    )
+    height: int = Field(
+        default=224,
+        title="Classification model input height",
+        description="Height of the model input tensor in pixels.",
+    )
+    input_tensor: InputTensorEnum = Field(
+        default=InputTensorEnum.nhwc,
+        title="Model Input Tensor Shape",
+        description="Tensor format expected by the model: 'nhwc' or 'nchw'.",
+    )
+    input_pixel_format: PixelFormatEnum = Field(
+        default=PixelFormatEnum.rgb,
+        title="Model Input Pixel Color Format",
+        description="Pixel colorspace expected by the model: 'rgb' or 'bgr'.",
+    )
+    input_dtype: InputDTypeEnum = Field(
+        default=InputDTypeEnum.int,
+        title="Model Input D Type",
+        description="Data type of the model input tensor ('int', 'float', or 'float_denorm').",
     )
     object_config: CustomClassificationObjectConfig | None = Field(default=None)
     state_config: CustomClassificationStateConfig | None = Field(default=None)

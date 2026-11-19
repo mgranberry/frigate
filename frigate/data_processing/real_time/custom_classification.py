@@ -1,9 +1,10 @@
-"""Real time processor that works with classification tflite models."""
+"""Real time processor for custom classification models."""
 
 import datetime
 import logging
 import os
 import time
+from abc import ABC, abstractmethod
 from typing import Any
 
 import cv2
@@ -15,24 +16,271 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.config.classification import CustomClassificationConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
+from frigate.detectors.detector_config import (
+    InputDTypeEnum,
+    InputTensorEnum,
+    PixelFormatEnum,
+)
 from frigate.log import suppress_stderr_during
+from frigate.object_detection.util import tensor_transform
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed, load_labels
-from frigate.util.classification import resize_classification_image
+from frigate.util.classification import (
+    CLASSIFICATION_INPUT_SIZE,
+    resize_classification_image,
+)
 from frigate.util.file import trim_oldest_files
 from frigate.util.image import calculate_region
+from frigate.util.model import get_ort_providers
 from frigate.util.object import box_overlaps
 
 from ..types import DataProcessorMetrics
 from .api import DeferredRealtimeProcessorApi
 
 try:
-    from tflite_runtime.interpreter import Interpreter
+    from tflite_runtime.interpreter import Interpreter, load_delegate
 except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter
+    from ai_edge_litert.interpreter import Interpreter, load_delegate
 
 logger = logging.getLogger(__name__)
 
 MAX_OBJECT_CLASSIFICATIONS = 16
+
+
+def _crop_and_resize_object(
+    rgb: np.ndarray,
+    box: list[int] | tuple[int, int, int, int],
+    target_size: tuple[int, int],
+    strategy: str = "square",
+    scale: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Crop an object from an RGB frame and resize according to strategy."""
+    xmin, ymin, xmax, ymax = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+    img_h, img_w = rgb.shape[:2]
+    if strategy == "square":
+        x, y, x2, y2 = calculate_region(
+            rgb.shape,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            int(max(xmax - xmin, ymax - ymin) * scale),
+            1.0,
+        )
+        crop = rgb[y:y2, x:x2]
+        return crop, resize_classification_image(crop, target_size)
+
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+    half_w = (xmax - xmin) * scale / 2.0
+    half_h = (ymax - ymin) * scale / 2.0
+    x = max(0, int(cx - half_w))
+    y = max(0, int(cy - half_h))
+    x2 = min(img_w, max(x + 1, int(cx + half_w)))
+    y2 = min(img_h, max(y + 1, int(cy + half_h)))
+    crop = rgb[y:y2, x:x2]
+
+    if strategy == "letterbox":
+        tw, th = target_size
+        ch, cw = crop.shape[:2]
+        ratio = min(tw / max(1, cw), th / max(1, ch))
+        nw = max(1, int(round(cw * ratio)))
+        nh = max(1, int(round(ch * ratio)))
+        resized = cv2.resize(crop, (nw, nh))
+        canvas = np.zeros((th, tw, 3), dtype=np.uint8)
+        y_off = (th - nh) // 2
+        x_off = (tw - nw) // 2
+        canvas[y_off : y_off + nh, x_off : x_off + nw] = resized
+        return crop, canvas
+
+    return crop, resize_classification_image(crop, target_size)
+
+
+def _normalize_scores(raw: np.ndarray) -> np.ndarray:
+    """Convert raw logits or unnormalized scores into a 1D float32 probability vector."""
+    arr = np.asarray(raw, dtype=np.float32).ravel()
+    if arr.size == 0:
+        return arr
+    total = float(arr.sum())
+    if (
+        np.all(arr >= 0.0)
+        and total > 0.0
+        and (abs(total - 1.0) <= 1e-2 or np.max(arr) <= 1.0)
+    ):
+        return arr / total
+    exps = np.exp(arr - np.max(arr))
+    return np.asarray(exps / exps.sum(), dtype=np.float32)
+
+
+class ClassificationBackend(ABC):
+    """Runtime backend interface for custom classification models."""
+
+    backend_name: str
+    input_size: tuple[int, int]
+
+    def __init__(
+        self,
+        width: int = CLASSIFICATION_INPUT_SIZE[0],
+        height: int = CLASSIFICATION_INPUT_SIZE[1],
+        input_tensor: InputTensorEnum = InputTensorEnum.nhwc,
+        input_pixel_format: PixelFormatEnum = PixelFormatEnum.rgb,
+        input_dtype: InputDTypeEnum = InputDTypeEnum.int,
+    ) -> None:
+        self.input_size = (int(width), int(height))
+        self.input_transform = tensor_transform(input_tensor)
+        self.input_pixel_format = input_pixel_format
+        self.input_dtype = input_dtype
+
+    def _transform_input(self, resized_rgb: np.ndarray) -> np.ndarray:
+        """Format an RGB (H, W, 3) uint8 crop to match the model's declared input spec."""
+        img = (
+            cv2.cvtColor(resized_rgb, cv2.COLOR_RGB2BGR)
+            if self.input_pixel_format == PixelFormatEnum.bgr
+            else resized_rgb
+        )
+        tensor_input: np.ndarray = np.expand_dims(img, axis=0)
+        if self.input_transform:
+            tensor_input = np.transpose(tensor_input, self.input_transform)
+        if self.input_dtype == InputDTypeEnum.float:
+            tensor_input = tensor_input.astype(np.float32) / 255.0
+        elif self.input_dtype == InputDTypeEnum.float_denorm:
+            tensor_input = tensor_input.astype(np.float32)
+        return tensor_input
+
+    @abstractmethod
+    def predict(self, resized_rgb: np.ndarray) -> np.ndarray:
+        """Run inference on an RGB crop sized to input_size and return 1D probabilities."""
+
+
+class TFLiteClassifierBackend(ClassificationBackend):
+    """TFLite / LiteRT backend supporting CPU and Coral EdgeTPU delegates."""
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str | None = None,
+        width: int = CLASSIFICATION_INPUT_SIZE[0],
+        height: int = CLASSIFICATION_INPUT_SIZE[1],
+        input_tensor: InputTensorEnum = InputTensorEnum.nhwc,
+        input_pixel_format: PixelFormatEnum = PixelFormatEnum.rgb,
+        input_dtype: InputDTypeEnum = InputDTypeEnum.int,
+    ) -> None:
+        super().__init__(
+            width=width,
+            height=height,
+            input_tensor=input_tensor,
+            input_pixel_format=input_pixel_format,
+            input_dtype=input_dtype,
+        )
+        delegates = []
+        dev = (device or "").strip()
+        if dev.lower() in ("edgetpu", "usb", "pci") or dev.lower().startswith(
+            ("usb:", "pci:")
+        ):
+            delegate_opts = {} if dev.lower() == "edgetpu" else {"device": dev}
+            delegates = [load_delegate("libedgetpu.so.1.0", delegate_opts)]
+        self.backend_name = "EdgeTPU" if delegates else "TFLite"
+        with suppress_stderr_during("tflite_interpreter_init"):
+            self.interpreter = Interpreter(
+                model_path=model_path,
+                num_threads=2,
+                experimental_delegates=delegates or None,
+            )
+            self.interpreter.allocate_tensors()
+        self.tensor_input_details = self.interpreter.get_input_details()
+        self.tensor_output_details = self.interpreter.get_output_details()
+
+    def predict(self, resized_rgb: np.ndarray) -> np.ndarray:
+        tensor_in = self._transform_input(resized_rgb)
+        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], tensor_in)
+        self.interpreter.invoke()
+        res: np.ndarray = self.interpreter.get_tensor(
+            self.tensor_output_details[0]["index"]
+        )[0]
+        return _normalize_scores(res)
+
+
+class ONNXClassifierBackend(ClassificationBackend):
+    """ONNX Runtime backend using Frigate's get_ort_providers()."""
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str | None = "AUTO",
+        width: int = CLASSIFICATION_INPUT_SIZE[0],
+        height: int = CLASSIFICATION_INPUT_SIZE[1],
+        input_tensor: InputTensorEnum = InputTensorEnum.nhwc,
+        input_pixel_format: PixelFormatEnum = PixelFormatEnum.rgb,
+        input_dtype: InputDTypeEnum = InputDTypeEnum.int,
+    ) -> None:
+        super().__init__(
+            width=width,
+            height=height,
+            input_tensor=input_tensor,
+            input_pixel_format=input_pixel_format,
+            input_dtype=input_dtype,
+        )
+        import onnxruntime as ort
+
+        dev = device or "AUTO"
+        providers, provider_options = get_ort_providers(
+            force_cpu=(dev == "CPU"), device=dev
+        )
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        session = ort.InferenceSession(
+            model_path,
+            sess_options=options,
+            providers=providers,
+            provider_options=provider_options,
+        )
+        self.backend_name = session.get_providers()[0]
+        self.input_name = session.get_inputs()[0].name
+
+        in_w, in_h = self.input_size
+        warm_arr = self._transform_input(np.zeros((in_h, in_w, 3), dtype=np.uint8))
+        for _ in range(2):
+            session.run(None, {self.input_name: warm_arr})
+        self.session = session
+
+    def predict(self, resized_rgb: np.ndarray) -> np.ndarray:
+        tensor_in = self._transform_input(resized_rgb)
+        res = self.session.run(None, {self.input_name: tensor_in})[0][0]
+        return _normalize_scores(res)
+
+
+def load_classification_backend(
+    model_dir: str,
+    model_config: CustomClassificationConfig,
+) -> tuple[ClassificationBackend | None, dict[int, str]]:
+    """Load the first available classification backend (.onnx, .tflite) and labelmap."""
+    labelmap_path = os.path.join(model_dir, "labelmap.txt")
+    if not os.path.exists(labelmap_path):
+        return None, {}
+
+    common_kwargs: dict[str, Any] = {
+        "device": model_config.device,
+        "width": model_config.width,
+        "height": model_config.height,
+        "input_tensor": model_config.input_tensor,
+        "input_pixel_format": model_config.input_pixel_format,
+        "input_dtype": model_config.input_dtype,
+    }
+
+    onnx_path = os.path.join(model_dir, "model.onnx")
+    if os.path.exists(onnx_path):
+        return (
+            ONNXClassifierBackend(onnx_path, **common_kwargs),
+            load_labels(labelmap_path, prefill=0, indexed=False),
+        )
+
+    tflite_path = os.path.join(model_dir, "model.tflite")
+    if os.path.exists(tflite_path):
+        return (
+            TFLiteClassifierBackend(tflite_path, **common_kwargs),
+            load_labels(labelmap_path, prefill=0, indexed=False),
+        )
+
+    return None, {}
 
 
 class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
@@ -52,9 +300,7 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
         self.requestor = requestor
         self.model_dir = os.path.join(MODEL_CACHE_DIR, self.model_config.name)
         self.train_dir = os.path.join(CLIPS_DIR, self.model_config.name, "train")
-        self.interpreter: Interpreter | None = None
-        self.tensor_input_details: list[dict[str, Any]] | None = None
-        self.tensor_output_details: list[dict[str, Any]] | None = None
+        self.backend: ClassificationBackend | None = None
         self.labelmap: dict[int, str] = {}
         self.classifications_per_second = EventsPerSecond()
         self.state_history: dict[str, dict[str, Any]] = {}
@@ -74,28 +320,12 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
         self.__build_detector()
 
     def __build_detector(self) -> None:
-        model_path = os.path.join(self.model_dir, "model.tflite")
-        labelmap_path = os.path.join(self.model_dir, "labelmap.txt")
-
-        if not os.path.exists(model_path) or not os.path.exists(labelmap_path):
-            self.interpreter = None
-            self.tensor_input_details = None
-            self.tensor_output_details = None
-            self.labelmap = {}
-            return
-
-        # Suppress TFLite delegate creation messages that bypass Python logging
-        with suppress_stderr_during("tflite_interpreter_init"):
-            self.interpreter = Interpreter(
-                model_path=model_path,
-                num_threads=2,
-            )
-            self.interpreter.allocate_tensors()
-        self.tensor_input_details = self.interpreter.get_input_details()
-        self.tensor_output_details = self.interpreter.get_output_details()
-        self.labelmap = load_labels(labelmap_path, prefill=0, indexed=False)
-        self._forget_unknown_states()
-        self.classifications_per_second.start()
+        self.backend, self.labelmap = load_classification_backend(
+            self.model_dir, self.model_config
+        )
+        if self.backend is not None:
+            self._forget_unknown_states()
+            self.classifications_per_second.start()
 
     def _forget_unknown_states(self) -> None:
         """Drop verified states that are not labels of the loaded model.
@@ -276,7 +506,12 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
         cropped_frame = rgb[y1:y2, x1:x2]
 
         try:
-            resized_frame = resize_classification_image(cropped_frame)
+            target_size = (
+                self.backend.input_size
+                if self.backend is not None
+                else CLASSIFICATION_INPUT_SIZE
+            )
+            resized_frame = resize_classification_image(cropped_frame, target_size)
         except Exception:
             logger.warning("Failed to resize image for state classification")
             return
@@ -301,8 +536,8 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
         resized_frame: np.ndarray,
         crop_bgr: np.ndarray,
     ) -> None:
-        if self.interpreter is None:
-            # When interpreter is None, always save (score is 0.0, which is < 1.0)
+        if self.backend is None:
+            # When backend is None, always save (score is 0.0, which is < 1.0)
             if self._should_save_image(camera, "unknown", 0.0):
                 save_attempts = (
                     self.model_config.save_attempts
@@ -320,16 +555,7 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
                 )
             return
 
-        if not self.tensor_input_details or not self.tensor_output_details:
-            return
-
-        input = np.expand_dims(resized_frame, axis=0)
-        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], input)
-        self.interpreter.invoke()
-        res: np.ndarray = self.interpreter.get_tensor(
-            self.tensor_output_details[0]["index"]
-        )[0]
-        probs = res / res.sum(axis=0)
+        probs = self.backend.predict(resized_frame)
         logger.debug(
             f"{self.model_config.name} Ran state classification with probabilities: {probs}"
         )
@@ -421,11 +647,9 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
 
         self.model_dir = os.path.join(MODEL_CACHE_DIR, self.model_config.name)
         self.train_dir = os.path.join(CLIPS_DIR, self.model_config.name, "train")
-        self.interpreter: Interpreter | None = None
+        self.backend: ClassificationBackend | None = None
         self.sub_label_publisher = sub_label_publisher
         self.requestor = requestor
-        self.tensor_input_details: list[dict[str, Any]] | None = None
-        self.tensor_output_details: list[dict[str, Any]] | None = None
         self.classification_history: dict[str, list[tuple[str, float, float]]] = {}
         self.labelmap: dict[int, str] = {}
         self.classifications_per_second = EventsPerSecond()
@@ -443,26 +667,17 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
         self.__build_detector()
 
     def __build_detector(self) -> None:
-        model_path = os.path.join(self.model_dir, "model.tflite")
-        labelmap_path = os.path.join(self.model_dir, "labelmap.txt")
-
-        if not os.path.exists(model_path) or not os.path.exists(labelmap_path):
-            self.interpreter = None
-            self.tensor_input_details = None
-            self.tensor_output_details = None
-            self.labelmap = {}
-            return
-
-        # Suppress TFLite delegate creation messages that bypass Python logging
-        with suppress_stderr_during("tflite_interpreter_init"):
-            self.interpreter = Interpreter(
-                model_path=model_path,
-                num_threads=2,
+        self.backend, self.labelmap = load_classification_backend(
+            self.model_dir, self.model_config
+        )
+        if self.backend is not None:
+            logger.info(
+                "Loaded %s object classifier (%dx%d) for %s",
+                self.backend.backend_name,
+                self.backend.input_size[0],
+                self.backend.input_size[1],
+                self.model_config.name,
             )
-            self.interpreter.allocate_tensors()
-        self.tensor_input_details = self.interpreter.get_input_details()
-        self.tensor_output_details = self.interpreter.get_output_details()
-        self.labelmap = load_labels(labelmap_path, prefill=0, indexed=False)
 
     def __update_metrics(self, duration: float) -> None:
         self.classifications_per_second.update()
@@ -567,24 +782,21 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             return
 
         now = datetime.datetime.now().timestamp()
-        x, y, x2, y2 = calculate_region(
-            frame.shape,
-            obj_data["box"][0],
-            obj_data["box"][1],
-            obj_data["box"][2],
-            obj_data["box"][3],
-            max(
-                obj_data["box"][2] - obj_data["box"][0],
-                obj_data["box"][3] - obj_data["box"][1],
-            ),
-            1.0,
-        )
-
         rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
-        crop = rgb[y:y2, x:x2]
 
         try:
-            resized_crop = resize_classification_image(crop)
+            target_size = (
+                self.backend.input_size
+                if self.backend is not None
+                else CLASSIFICATION_INPUT_SIZE
+            )
+            crop, resized_crop = _crop_and_resize_object(
+                rgb,
+                obj_data["box"],
+                target_size,
+                strategy=self.model_config.object_config.crop_strategy,
+                scale=self.model_config.object_config.crop_scale,
+            )
         except Exception:
             logger.warning("Failed to resize image for object classification")
             return
@@ -616,7 +828,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
         resized_crop: np.ndarray,
         crop_bgr: np.ndarray,
     ) -> None:
-        if self.interpreter is None:
+        if self.backend is None:
             save_attempts = (
                 self.model_config.save_attempts
                 if self.model_config.save_attempts is not None
@@ -640,16 +852,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
             self.classification_history[object_id].append(("unknown", 0.0, timestamp))
             return
 
-        if not self.tensor_input_details or not self.tensor_output_details:
-            return
-
-        input = np.expand_dims(resized_crop, axis=0)
-        self.interpreter.set_tensor(self.tensor_input_details[0]["index"], input)
-        self.interpreter.invoke()
-        res: np.ndarray = self.interpreter.get_tensor(
-            self.tensor_output_details[0]["index"]
-        )[0]
-        probs = res / res.sum(axis=0)
+        probs = self.backend.predict(resized_crop)
         logger.debug(
             f"{self.model_config.name} Ran object classification with probabilities: {probs}"
         )

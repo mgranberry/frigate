@@ -44,13 +44,15 @@ CLASSIFICATION_INPUT_SIZE = (224, 224)
 logger = logging.getLogger(__name__)
 
 
-def resize_classification_image(image: np.ndarray) -> np.ndarray:
+def resize_classification_image(
+    image: np.ndarray, size: tuple[int, int] = CLASSIFICATION_INPUT_SIZE
+) -> np.ndarray:
     """Resize an image to the classification model input size.
 
     Training and inference both need to use this, otherwise the model is
     trained on different pixels than the ones it is later run on.
     """
-    return cv2.resize(image, CLASSIFICATION_INPUT_SIZE)
+    return cv2.resize(image, size)
 
 
 def prepare_training_dataset(dataset_dir: str, output_dir: str) -> None:
